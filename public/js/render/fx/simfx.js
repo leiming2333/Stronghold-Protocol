@@ -100,7 +100,7 @@ export class FxSim {
         else this.zone(at.x, at.y, at.z, r, col, d, 'ring', true);
         break;
       }
-      case 'chill': this.flashScreen(col, 0.35, 0.8); this.snowfall(col); break;
+      case 'chill': this.flashScreen(col, 0.45, 1); this.snowfall(col); break;
       case 'heal': this.heal(at.v || { x: at.x, y: at.y, z: at.z }, 0); break;
       case 'healAoe': {
         this.ring(at.x, at.y, at.z, 0.2, r, col, 0.6);

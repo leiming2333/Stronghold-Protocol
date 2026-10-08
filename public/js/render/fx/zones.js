@@ -180,11 +180,24 @@ export class FxZones {
     this.tintSprite.tint = tint;
   }
 
-  /** A short flurry of snow over the field (cold wind). */
+  /**
+   * A blizzard sweeping the screen from the bottom up (cold wind — most visibly the 谢拉格 bond's 盟约寒风).
+   * Snowflakes rise off the bottom edge on a crosswind with gust streaks racing along, so the gust reads as wind
+   * driving up the field, not quiet snowfall (community report of 2026-10-08 「谢拉格的效果特性不明显，暴风雪应该
+   * 从下向上刮」).
+   */
   snowfall(tint) {
     const size = this.ctx.screenSize();
-    for (let i = 0; i < (this.quality === 'low' ? 10 : 26); i++) {
-      this.particle('dot', Math.random() * size.width, Math.random() * size.height * 0.7, { tint, vx: 30 + Math.random() * 40, vy: 60 + Math.random() * 60, life: 1 + Math.random() * 0.6, s0: 0.25 + Math.random() * 0.3, s1: 0.1, a0: 0.8, a1: 0, fadeIn: 0.2 });
+    const W = size.width, H = size.height, low = this.quality === 'low';
+    // snowflakes: lifted off the bottom edge (a share starts below it), blown up-right and tumbled by the gust
+    for (let i = 0; i < (low ? 22 : 48); i++) {
+      const vy = -H * (0.55 + Math.random() * 0.5), vx = W * (0.04 + Math.random() * 0.1);
+      this.particle('dot', Math.random() * W, H * (0.55 + Math.random() * 0.55), { tint, vx, vy, life: 1.4 + Math.random() * 0.9, s0: 0.22 + Math.random() * 0.34, s1: 0.08, a0: 0.9, a1: 0, fadeIn: 0.12, spin: (Math.random() - 0.5) * 6 });
+    }
+    // gust streaks: thin wind lines racing up through the field along their velocity
+    for (let i = 0; i < (low ? 4 : 10); i++) {
+      const vy = -H * (0.9 + Math.random() * 0.6), vx = W * (0.1 + Math.random() * 0.12);
+      this.particle('streak', Math.random() * W, H * (0.6 + Math.random() * 0.5), { tint, vx, vy, life: 0.7 + Math.random() * 0.4, s0: 0.04 + Math.random() * 0.03, s1: 0.02, sx: 6 + Math.random() * 6, a0: 0.55, a1: 0, fadeIn: 0.08, rot: Math.atan2(vy, vx) });
     }
   }
 
