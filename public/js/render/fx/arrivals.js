@@ -16,10 +16,14 @@ export class FxArrivals {
   }
 
   /**
-   * Promotion (精锐晋升, a merge) at the elite's spot — the board tile of the consumed copy it replaced (PRTS 卫戍协议/
-   * 帮助 "若消耗已部署至作战区的干员，则发送至作战区对应位置") or its bench slot: a gold pillar with a white core, a shockwave
-   * and a hex ring on the ground, rising motes; `from` = world points of the other consumed copies (gold streaks from
-   * them to the elite). Counted in `promotions` (render/app.js setPrep; tests).
+   * Promotion (精锐晋升, a merge of three copies) at the elite's spot — the board tile of the consumed copy it replaced
+   * (PRTS 卫戍协议/帮助 "若消耗已部署至作战区的干员，则发送至作战区对应位置") or its bench slot. The loudest cue on the
+   * board, so a merge reads at a glance over the deploy flash and a skill burst: `from` = world points of the other
+   * consumed copies, each feeding the elite two gold streaks (a bright one over a soft one) and, at high quality, a
+   * flare where it stood; at the elite a tall gold pillar around a white-hot core with a slow sky beam, a star flare
+   * and a ground glow, a wide shockwave plus two hex rings sweeping out (a second, slower one behind), and a dense
+   * golden burst (star-shaped sparks at high quality) with slow motes rising through the pillar. Counted in
+   * `promotions` (render/app.js setPrep; tests).
    * @param {any} view
    * @param {Array<{ x: number, y: number, z?: number }>} [from]
    */
@@ -29,13 +33,42 @@ export class FxArrivals {
     const z = view.z || 0;
     const g = this._proj(view.x, view.y, z, this._g);
     const gx = g.x, gy = g.y, s = g.s;
-    for (const f of from) if (f && Number.isFinite(f.x) && Number.isFinite(f.y)) this.streak(f.x, f.y, view.x, view.y, Math.max(z, f.z || 0) + 0.3, SKILL_GOLD, 0.45);
-    this.particle('pillar', gx, gy, { tint: SKILL_GOLD, life: 0.8, s0: (s / 64) * 1.1, s1: (s / 64) * 1.4, a0: 0.95, a1: 0, sx: 0.85, ay: 1 });
-    this.particle('pillar', gx, gy, { tint: 0xffffff, life: 0.42, s0: (s / 64) * 0.9, s1: (s / 64) * 1.2, a0: 0.9, a1: 0, sx: 0.3, ay: 1 });
-    this.ring(view.x, view.y, z, 0.15, 1.6, 0xffe7a0, 0.5, 'shock');
-    this.ring(view.x, view.y, z, 0.3, 1.2, SKILL_GOLD, 0.7, 'hex');
+    // the consumed copies feed the elite: two streaks each (0.3 / 0.55 tiles up, so the pair reads as one thick line),
+    // plus a flare standing where each was — the origin is read before streak() re-projects into the shared buffers
+    for (const f of from) {
+      if (!f || !Number.isFinite(f.x) || !Number.isFinite(f.y)) continue;
+      const fz = Math.max(z, f.z || 0);
+      if (this.rich) {
+        const fp = this._proj(f.x, f.y, fz, this._q);
+        this.particle('flare', fp.x, fp.y, { tint: 0xfff2c0, life: 0.34, s0: (fp.s / 128) * 0.95, s1: (fp.s / 128) * 0.25, a0: 1, a1: 0, rot: Math.random() * 3 });
+      }
+      this.streak(f.x, f.y, view.x, view.y, fz + 0.3, SKILL_GOLD, 0.65);
+      this.streak(f.x, f.y, view.x, view.y, fz + 0.55, 0xfff2c0, 0.5);
+    }
+    // the elite: a taller gold pillar (up to 1.85 tiles) around a white-hot core and a slow sky beam; a star flare and a
+    // ground glow at the chest — the flash the old cue lacked, and what makes the merge unmistakable from a distance
+    this.particle('pillar', gx, gy, { tint: SKILL_GOLD, life: 1.05, s0: (s / 64) * 1.25, s1: (s / 64) * (this.rich ? 1.85 : 1.5), a0: 0.95, a1: 0, sx: 0.9, ay: 1 });
+    this.particle('pillar', gx, gy, { tint: 0xffffff, life: 0.55, s0: (s / 64) * 1.0, s1: (s / 64) * 1.5, a0: 0.9, a1: 0, sx: 0.4, ay: 1 });
+    this.particle('pillar', gx, gy, { tint: 0xfff6cc, life: 0.95, s0: (s / 64) * 0.3, s1: (s / 64) * 0.95, a0: 0.75, a1: 0, sx: 0.22, ay: 1, fadeIn: 0.15 });
     const c = this._chest(view, this._q);
-    this.burst(c.x, c.y, s, this.rich ? 12 : 5, 0xffe28a, { speed: 1.5, up: 1.8, life: 0.8, tex: 'dot', size: 0.36 });
+    const cx = c.x, cy = c.y;
+    this.particle('flare', cx, cy, { tint: 0xfff0b0, life: 0.42, s0: (s / 128) * 2.6, s1: (s / 128) * 0.7, a0: 1, a1: 0, rot: Math.random() * 3 });
+    this.particle('glow', cx, cy, { tint: SKILL_GOLD, life: 0.5, s0: (s / 128) * 1.4, s1: (s / 128) * 3.0, a0: 0.9, a1: 0 });
+    // the ground: a wider shockwave, a bigger hex ring, and a second slower hex sweeping out behind it
+    this.ring(view.x, view.y, z, 0.1, 2.2, 0xffe7a0, 0.6, 'shock');
+    this.ring(view.x, view.y, z, 0.2, 1.7, SKILL_GOLD, 0.9, 'hex');
+    this.ring(view.x, view.y, z, 0.45, 1.15, 0xfff2c0, 1.05, 'hex');
+    // dense golden burst off the chest, and slow motes rising through the pillar (cosmetic: high quality only)
+    this.burst(cx, cy, s, this.rich ? 18 : 8, 0xffe28a, { speed: 1.7, up: 2.0, life: 0.95, tex: this.rich ? 'spark' : 'dot', size: 0.4 });
+    if (this.rich) {
+      for (let i = 0; i < 8; i++) {
+        const a = (i / 8) * Math.PI * 2 + Math.random() * 0.6;
+        this.particle('dot', gx + Math.cos(a) * s * 0.28, gy + Math.sin(a) * s * 0.1, {
+          tint: 0xffe9a8, vx: Math.cos(a) * s * 0.08, vy: -s * (0.45 + Math.random() * 0.6), drag: 0.35,
+          life: 1.15 + Math.random() * 0.45, s0: (s / 64) * 0.15, s1: (s / 64) * 0.02, a0: 0.85, a1: 0, fadeIn: 0.2,
+        });
+      }
+    }
   }
 
   death(view) {

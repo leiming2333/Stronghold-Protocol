@@ -76,6 +76,23 @@ describe('fx.promote', () => {
     fx.promote(null);
     assert.equal(fx.counts.promotions, 1, 'no view: nothing');
   });
+
+  // the merge is the loudest cue on the board (a 3-copy 精锐晋升 outranks the deploy flash and a skill burst): the
+  // flash the old cue lacked, a third ring, and a pillar that climbs further than a skill activation's
+  test('louder than a skill burst: a flare and a glow, three rings, a taller pillar, star sparks', () => {
+    const a = makeFx(), b = makeFx();
+    a.promote(view(5, 10), [{ x: 3, y: 11, z: 0 }]);
+    b.skill(view(5, 10), true);
+    const names = new Set(a.parts.map((p) => texName(a, p.sp)));
+    assert.ok(names.has('flare'), 'a star flare at the chest (the old cue had none)');
+    assert.ok(names.has('glow'), 'a ground glow at the chest');
+    assert.ok(a.rings.length >= 3, `three rings (${a.rings.length})`);
+    const pillar = (fx) => Math.max(...fx.parts.filter((p) => texName(fx, p.sp) === 'pillar').map((p) => p.s1));
+    assert.ok(pillar(a) > pillar(b), `its pillar climbs further (${pillar(a)} > ${pillar(b)})`);
+    assert.ok(Math.max(...a.rings.map((r) => r.r1)) > Math.max(...b.rings.map((r) => r.r1)), 'its shockwave is wider');
+    assert.ok(a.parts.filter((p) => texName(a, p.sp) === 'spark').length > 0, 'star-shaped sparks at high quality');
+    assert.ok(Math.max(...a.parts.map((p) => p.max)) > Math.max(...b.parts.map((p) => p.max)), 'and it lingers longer');
+  });
 });
 
 test('render/app.js plays the promotion cue instead of the deploy flash for a merge\'s elite', () => {
