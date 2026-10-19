@@ -101,6 +101,7 @@ import { encode, isDroppable, isErrCode, sendRaw, sendSession } from './net.js';
 import { getData as defaultGetData, lookup } from './data.js';
 import { Match as DefaultMatch } from './match/Match.js';
 import { KITTED_CHARS } from './sim/content/kits/index.js';
+import { PeerRelay } from './peerRelay.js';
 
 /** Room code alphabet: uppercase letters without I and O (and no digits, so no 0/1). */
 export const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -240,6 +241,8 @@ export class Lobby {
     this.resyncTimers = new Map();
     /** per-network limit warnings: at most one log line per 10 s (the rest are counted) */
     this.limitLog = { at: -Infinity, suppressed: 0 };
+    this.peerRelay = new PeerRelay({ now, log });
+    this.publicDeliveries = new WeakMap();
   }
 
   /** @param {string} code @returns {Room | null} */
@@ -320,6 +323,20 @@ export class Lobby {
       case 'room.diy': return this.diy(session, msg);
       case 'room.spectate': return this.spectate(session, msg);
       case 'room.removeSpectator': return this.removeSpectator(session, msg);
+      case 'p2p.enable': {
+        this.peerRelay.enable(session, msg.enabled);
+        const room = this.roomOf(session);
+        if (room) this.peerRelay.sync(room, [...this.memberSessions(room)], session);
+        else sendSession(session, { t: 'p2p.config', enabled: false });
+        return OK;
+      }
+      case 'p2p.signal':
+      case 'p2p.ready': {
+        const room = this.roomOf(session);
+        if (!room) return fail(ERR.NOT_IN_ROOM);
+        this.peerRelay.sync(room, [...this.memberSessions(room)]);
+        return msg.t === 'p2p.signal' ? this.peerRelay.signal(room, session, msg) : this.peerRelay.ready(room, session, msg);
+      }
       default:
         if (typeof msg.t === 'string' && msg.t.startsWith('g.')) return this.routeGame(session, msg);
         return fail(ERR.BAD_MSG, `unhandled type ${String(msg.t).slice(0, 32)}`);
@@ -328,6 +345,7 @@ export class Lobby {
 
   /** The session's socket closed. @param {import('./net.js').Session} session */
   onDisconnect(session) {
+    this.peerRelay.disconnect(session);
     this.clearResync(session.playerId); // the next resume resyncs immediately
     const room = this.roomOf(session);
     // a solo run may be resumed within singleReconnectTime (24 h); everything else keeps the registry's window
@@ -362,6 +380,7 @@ export class Lobby {
     this.graceTimers.clear();
     for (const t of this.resyncTimers.values()) clearTimeout(t);
     this.resyncTimers.clear();
+    this.peerRelay.dispose();
   }
 
   // ---------------------------------------------------------------------------------------------------
@@ -1004,6 +1023,7 @@ export class Lobby {
    */
   disposeRoom(room, reason) {
     if (room.disposed) return;
+    this.peerRelay.clear(room);
     room.disposed = true;
     if (this.rooms.get(room.code) === room) this.rooms.delete(room.code);
     const ctx = room.matchCtx;
@@ -1058,19 +1078,34 @@ export class Lobby {
 
   broadcastState(room) {
     if (room.disposed) return;
+    this.peerRelay.sync(room, [...this.memberSessions(room)]);
     const data = encode(room.toState());
     for (const session of this.memberSessions(room)) sendRaw(session.ws, data);
   }
 
   sendState(room, session) {
+    this.peerRelay.sync(room, [...this.memberSessions(room)], session);
     sendSession(session, room.toState());
+  }
+
+  /** A common room stream orders public snapshots across WebSocket and RTC, including equal serverNow values. */
+  stampPublic(room, msg) {
+    if (msg?.t !== 'm.public') return msg;
+    let stream = this.publicDeliveries.get(room);
+    if (!stream) {
+      stream = { epoch: randomBytes(16).toString('hex'), seq: 0 };
+      this.publicDeliveries.set(room, stream);
+    }
+    return { ...msg, deliveryEpoch: stream.epoch, deliverySeq: ++stream.seq };
   }
 
   /** Match broadcast: encode once, send to every connected member. @returns {string | null} the encoded frame */
   broadcastRoom(room, msg) {
     if (room.disposed) return null;
+    msg = this.stampPublic(room, msg);
     const data = encode(msg);
     if (data == null) { this.log.error(`[lobby] ${room.code} unserializable broadcast ${msg && msg.t}`); return null; }
+    if (msg.t === 'm.public' && this.peerRelay.broadcast(room, [...this.memberSessions(room)], data)) return data;
     const droppable = isDroppable(msg);
     for (const session of this.memberSessions(room)) sendRaw(session.ws, data, { droppable });
     return data;
@@ -1083,6 +1118,6 @@ export class Lobby {
     if (!seat || seat.isBot || seat.left) return false;
     const session = this.registry.byId(playerId);
     if (!session || session.roomCode !== room.code) return false;
-    return sendSession(session, msg);
+    return sendSession(session, this.stampPublic(room, msg));
   }
 }

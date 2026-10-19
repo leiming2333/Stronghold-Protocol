@@ -24,6 +24,9 @@ const isMap = (v, max, key, val) => {
   return true;
 };
 const isList = (v, max, item) => Array.isArray(v) && v.length <= max && v.every(item);
+const isPeerDescription = (v) => isPlain(v) && (v.type === 'offer' || v.type === 'answer') && isStr(v.sdp, 16 * 1024);
+const isPeerCandidate = (v) => isPlain(v) && isStr(v.candidate, 2048)
+  && (v.sdpMid === null || isStr(v.sdpMid, 256)) && (v.sdpMLineIndex === null || isInt(v.sdpMLineIndex, 0, 65535));
 
 // ---- client-side combat (DESIGN §14): b.progress / b.result payloads -------------------------------------------
 
@@ -320,6 +323,9 @@ export const C2S = {
   // session & lobby
   hello: { name: (v) => isStr(v, NAME_MAX_LEN) && v.trim().length > 0, token: (v) => v == null || isStr(v, 64), version: (v) => v == null || isInt(v, 0, 1e6), $optional: ['token', 'version'] },
   ping: { c: (v) => typeof v === 'number' && Number.isFinite(v) },
+  'p2p.enable': { enabled: isBool },
+  'p2p.signal': { epoch: isId, to: isId, description: isPeerDescription, candidate: isPeerCandidate, $optional: ['description', 'candidate'] },
+  'p2p.ready': { epoch: isId, ready: isBool, seq: (v) => Number.isSafeInteger(v) && v >= 0 },
   'room.create': { mode: (v) => v === 'solo' || v === 'coop', difficulty: (v) => DIFFICULTIES.includes(v) },
   'room.join': { code: (v) => isStr(v, ROOM_CODE_LEN + 2) && /^[A-Za-z0-9]+$/.test(v) },
   'room.leave': {},
@@ -396,6 +402,7 @@ export const C2S = {
 // Server → client message types (documentation + client dispatch table keys).
 export const S2C = [
   'welcome', 'ok', 'error', 'pong',
+  'p2p.config', 'p2p.signal', 'p2p.frame',
   'room.state', 'room.closed',
   'm.public', 'm.private', 'm.field', 'm.toast', 'm.ticker', 'm.emote', 'm.result',
   // m.unitStats { seq, round, units: [unitStatsEntry] } — the answer to g.unitStats (the requester only)
@@ -416,6 +423,7 @@ export function validateC2S(msg) {
   if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return 'not an object';
   const spec = typeof msg.t === 'string' && Object.hasOwn(C2S, msg.t) ? C2S[msg.t] : null;
   if (!spec) return `unknown type ${String(msg.t).slice(0, 32)}`;
+  if (msg.t === 'p2p.signal' && (msg.description !== undefined) === (msg.candidate !== undefined)) return 'exactly one signal required';
   if (msg.rid != null && !isInt(msg.rid, 0, 2 ** 31)) return 'bad rid';
   const optional = spec.$optional || [];
   for (const [k, check] of Object.entries(spec)) {

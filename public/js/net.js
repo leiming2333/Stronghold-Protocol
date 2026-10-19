@@ -32,6 +32,7 @@
 import { PROTOCOL_VERSION, ERR_TEXT } from '../../shared/constants.js';
 import { validateC2S } from '../../shared/protocol.js';
 import { N_ } from '../../shared/i18n.js';
+import { PeerTransport } from './p2p.js';
 
 export const REQUEST_TIMEOUT_MS = 8000;
 export const HELLO_TIMEOUT_MS = 8000;
@@ -117,6 +118,7 @@ export class Net {
    * @param {() => number} [opts.now]
    * @param {() => number} [opts.random]
    * @param {{setTimeout: Function, clearTimeout: Function, setInterval: Function, clearInterval: Function}} [opts.timers]
+   * @param {object} [opts.p2p] optional WebRTC transport dependencies; enabled:false opts out
    */
   constructor(opts = {}) {
     this.url = opts.url || null;
@@ -160,6 +162,7 @@ export class Net {
     this._lastRx = 0;
     this._unansweredSince = null; // time of the oldest ping sent since the last inbound frame
     this._clockSamples = [];   // [{ offset, rtt }]
+    this.peers = new PeerTransport(this, opts.p2p);
   }
 
   // ---- events ----------------------------------------------------------------------------------
@@ -528,6 +531,7 @@ export class Net {
       return;
     }
     if (!msg || typeof msg !== 'object' || Array.isArray(msg) || typeof msg.t !== 'string') return;
+    if (msg.t === 'm.public' && !this.peers.directSnapshot(msg)) return;
     const { t } = msg;
     const rid = msg.rid;
     const isHelloError = t === 'error' && rid != null && rid === this._helloRid;
@@ -563,6 +567,16 @@ export class Net {
   }
 
   // ---- heartbeat & clock -----------------------------------------------------------------------
+
+  /** A verified public snapshot; peer traffic never answers a WebSocket heartbeat or request. */
+  acceptPeerSnapshot(msg) {
+    if (this.status !== 'online' || msg?.t !== 'm.public') return;
+    if (Number.isFinite(msg.serverNow) && !this.clockSynced) {
+      this._addClockSample(msg.serverNow + (this.ping ?? 0) / 2 - this.now(), Infinity);
+    }
+    this._emit('m.public', msg);
+    this._emit('*', msg);
+  }
 
   _startHeartbeat() {
     this._clearTimer('_pingTimer', 'clearInterval');
