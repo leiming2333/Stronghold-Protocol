@@ -157,6 +157,11 @@ export class PeerTransport {
     }).catch(() => { if (generation === this.generation) this.dropLink(link); });
   }
 
+  /**
+   * Renew the lease (once a second). `seq` is the APPLIED watermark — the highest sequence whose snapshot reached
+   * game state, or that the state we hold has already superseded. It is never the last sequence we merely saw on the
+   * wire, and the server does not treat it as proof of delivery either (it always re-sends on its watchdog).
+   */
   pulse() {
     if (!this.config) return;
     const ready = [...this.links.values()].some((link) => !link.closed && link.channel?.readyState === 'open');
@@ -241,8 +246,13 @@ export class PeerTransport {
     let msg;
     try { msg = JSON.parse(frame.payload); } catch { return; }
     if (msg?.t !== 'm.public' || Object.hasOwn(msg, 'rid')) return;
+    if (!Number.isFinite(msg.serverNow)) return;
+    // The ACK watermark is a statement about GAME STATE, not about the wire: it moves only when this snapshot was
+    // applied, or when the state we already hold supersedes it. A frame we merely received — one that is lost in the
+    // channel, fails verification or never reaches game state — is never acknowledged, so the server's watchdog
+    // still puts it back on the WebSocket.
+    const stale = !this.directSnapshot(msg);
+    if (!stale) this.net.acceptPeerSnapshot(msg);
     this.seq = frame.seq;
-    if (!Number.isFinite(msg.serverNow) || !this.directSnapshot(msg)) return;
-    this.net.acceptPeerSnapshot(msg);
   }
 }

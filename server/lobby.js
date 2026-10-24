@@ -2533,35 +2533,65 @@ export class Lobby {
     sendSession(session, room.toState(this.now()));
   }
 
-  /** A common room stream orders public snapshots across WebSocket and RTC, including equal serverNow values. */
-  stampPublic(room, msg) {
-    if (msg?.t !== 'm.public') return msg;
+  /** The room's delivery stream: one order shared by the WebSocket and the peer path. */
+  publicStream(room) {
     let stream = this.publicDeliveries.get(room);
     if (!stream) {
       stream = { epoch: randomBytes(16).toString('hex'), seq: 0 };
       this.publicDeliveries.set(room, stream);
     }
-    return { ...msg, deliveryEpoch: stream.epoch, deliverySeq: ++stream.seq };
+    return stream;
+  }
+
+  /**
+   * Append the room's delivery stamps to bytes a caller already produced (a lane Worker's m.public). Splicing them
+   * into the finished JSON keeps the pass-through: the public view is still serialized exactly once per broadcast.
+   * Bytes that are not a JSON object come back unchanged — that frame carries no cross-transport order to honour.
+   * @param {string} bytes @param {string} epoch @param {number} seq
+   * @returns {string}
+   */
+  stampPublicBytes(bytes, epoch, seq) {
+    const end = bytes.lastIndexOf('}');
+    if (end < 0) return bytes;
+    let view;
+    try { view = JSON.parse(bytes); } catch { return bytes; }
+    if (!view || typeof view !== 'object' || Array.isArray(view)) return bytes;
+    return `${bytes.slice(0, end)},"deliveryEpoch":${JSON.stringify(epoch)},"deliverySeq":${seq}}`;
+  }
+
+  /**
+   * A public view joins the room's delivery stream: the peer route signs and forwards these stamped bytes, so a
+   * delayed copy from either transport can never overwrite newer state. Inert while `SP_P2P` is not enabled, which
+   * leaves the wire byte-identical with the merged state-delta transport (it owns its own per-connection baseline).
+   * @param {object} room @param {object} msg @param {string | null} [encoded] bytes a caller already produced
+   * @returns {{ msg: object, bytes: string }}
+   */
+  stampPublic(room, msg, encoded = null) {
+    if (!this.peerRelay.enabled || msg?.t !== 'm.public') return { msg, bytes: encoded ?? encode(msg) };
+    const stream = this.publicStream(room);
+    const deliverySeq = ++stream.seq;
+    const bytes = this.stampPublicBytes(encoded ?? encode(msg), stream.epoch, deliverySeq);
+    return { msg: { ...msg, deliveryEpoch: stream.epoch, deliverySeq }, bytes };
   }
 
   /** Match broadcast: encode once, send to every connected member. @returns {string | null} the encoded frame */
   broadcastRoom(room, msg, encoded = null) {
     if (room.disposed) return null;
-    // m.public carries the room's delivery order (stamps shared by both transports, peerRelay and state delta);
-    // the stamped copy is a fresh object, so its bytes are encoded here — the lane Worker's pre-encoded bytes
-    // cannot carry them. Every other type keeps the shared bytes the Worker produced.
-    const stamped = this.stampPublic(room, msg);
-    const data = stamped !== msg ? encode(stamped) : encoded ?? encode(msg);
+    let data = encoded ?? encode(msg);
     if (data == null) { this.log.error(`[lobby] ${room.code} unserializable broadcast ${msg && msg.t}`); return null; }
-    // per connection: sendSession runs the state transport, which owns each socket's delta baseline (and the
-    // droppable/backpressure rules) - one shared byte string in, one frame per member out. Peer delivery
-    // (server/peerRelay.js) takes the relay and its ready receivers out of that loop: they get the signed full
-    // view over WebRTC, and the relay guarantees every unconfirmed snapshot back over WebSocket within ackMs.
+    const stamped = this.stampPublic(room, msg, data);
+    msg = stamped.msg;
+    data = stamped.bytes;
     const members = [...this.memberSessions(room)];
-    const handled = stamped !== msg ? this.peerRelay.broadcast(room, members, data) : null;
+    // Peer delivery (server/peerRelay.js) takes the relay and its ready receivers out of the loop below: the relay
+    // gets the signed frame over its own socket (never compressed into a delta — it forwards these exact bytes) and
+    // each ready receiver is served by the channel, with the lobby's watchdog re-sending over WebSocket on timeout.
+    const routed = this.peerRelay.enabled && msg.t === 'm.public' ? this.peerRelay.broadcast(room, members, data) : null;
+    // per connection: sendSession runs the state transport, which owns each socket's delta baseline (and the
+    // droppable/backpressure rules) - one shared byte string in, one frame per member out
     for (const session of members) {
-      if (handled?.has(session)) continue;
-      sendSession(session, stamped, data);
+      if (routed?.has(session)) continue;
+      sendSession(session, msg, data);
     }
     return data;
   }
@@ -2574,7 +2604,7 @@ export class Lobby {
     const session = this.registry.byId(playerId);
     if (!session || session.roomCode !== room.code) return false;
     // A unicast m.public joins the room's delivery stream too (its stamps order it against peer frames).
-    const stamped = this.stampPublic(room, msg);
-    return stamped !== msg ? sendSession(session, stamped) : sendSession(session, msg, encoded);
+    const stamped = this.stampPublic(room, msg, encoded ?? encode(msg));
+    return sendSession(session, stamped.msg, stamped.bytes);
   }
 }

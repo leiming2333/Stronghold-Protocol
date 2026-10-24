@@ -7,6 +7,12 @@ export const P2P_LEASE_MS = 3000;
 export const P2P_ACK_MS = 2500;
 export const P2P_FRAME_BYTES = 60 * 1024;
 
+/** Operator switch: peer delivery is OPT-IN. Anything but an explicit enable keeps the server's own fanout. */
+export function p2pEnabledFromEnv(env = process.env) {
+  const value = String(env.SP_P2P ?? '').trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'on';
+}
+
 /** Validate operator-provided STUN/TURN configuration without ever logging credentials. */
 export function parseIceServers(value) {
   if (!value) return [];
@@ -31,7 +37,7 @@ export function parseIceServers(value) {
 
 /** One small star per room. Capability and readiness are tied to a particular WebSocket. */
 export class PeerRelay {
-  constructor({ now = Date.now, log = { warn() {} }, enabled = process.env.SP_P2P !== '0',
+  constructor({ now = Date.now, log = { warn() {} }, enabled = p2pEnabledFromEnv(),
     iceServers, ackMs = P2P_ACK_MS } = {}) {
     this.now = now;
     this.enabled = enabled;
@@ -107,6 +113,11 @@ export class PeerRelay {
     return { ok: true };
   }
 
+  /**
+   * A receiver's once-a-second lease renewal. `seq` is the watermark of the last snapshot it APPLIED (or that the
+   * state it already holds supersedes) — a client never acknowledges a frame it merely received.
+   * The server still does not take that watermark as proof of delivery: see `watch()`.
+   */
   ready(room, session, msg) {
     const plan = this.rooms.get(room);
     if (msg.epoch !== plan?.epoch && this.capable(session)) return { ok: true };
@@ -114,18 +125,14 @@ export class PeerRelay {
     if (!peer || plan.epoch !== msg.epoch || msg.seq > plan.seq || msg.seq < peer.ack) return { error: ERR.BAD_TARGET };
     if (!msg.ready) peer.blocked = false;
     if (msg.ready && peer.blocked) return { ok: true };
-    const advanced = msg.seq > peer.ack;
-    peer.ready = msg.ready;
-    peer.leaseUntil = msg.ready ? this.now() + P2P_LEASE_MS : 0;
     peer.ack = msg.seq;
-    if (!msg.ready) this.fallback(plan, peer);
-    else if (peer.pending && msg.seq >= peer.pending.seq) this.clearPending(peer);
-    else if (peer.pending && advanced && msg.seq >= peer.pending.oldestSeq) {
-      // A healthy receiver may always be a few frames behind an actively updating room.
-      // ACK progress proves the old delivery succeeded even while a newer snapshot is in flight.
-      peer.pending.oldestSeq = msg.seq + 1;
-      this.watch(plan, peer);
+    if (!msg.ready) {
+      // The route is being abandoned: whatever it had in flight goes out over WebSocket now.
+      this.fallback(plan, peer);
+      return { ok: true };
     }
+    peer.ready = msg.ready;
+    peer.leaseUntil = this.now() + P2P_LEASE_MS;
     return { ok: true };
   }
 
@@ -135,37 +142,77 @@ export class PeerRelay {
     peer.pending = null;
   }
 
+  /**
+   * The watchdog for the latest snapshot a receiver was given. It is armed once, is never postponed by a newer
+   * snapshot, and is never cancelled by an acknowledgement: a self-reported sequence number is a hint about the
+   * receiver's game state, not proof that it arrived. When it fires, the snapshot goes out over WebSocket
+   * regardless, so a receiver that confirmed a frame it never received, lost in the channel or could not verify
+   * recovers within `ackMs`. Only a receiver that confirmed nothing since the snapshot was armed loses its route.
+   */
   watch(plan, peer) {
     if (peer.timer) clearTimeout(peer.timer);
     peer.timer = setTimeout(() => {
-      if (this.rooms.get(plan.room) === plan) this.fallback(plan, peer, true);
+      peer.timer = null;
+      if (this.rooms.get(plan.room) !== plan || !peer.pending) return;
+      const confirmed = peer.ack >= peer.pending.seq || peer.ack > peer.pending.armedAck;
+      if (confirmed) this.resend(plan, peer);
+      else this.fallback(plan, peer, true);
     }, this.ackMs);
     peer.timer.unref?.();
   }
 
-  fallback(plan, peer, timeout = false) {
-    const latest = timeout && peer.pending ? encode({ ...peer.pending.frame, fallback: true }) : peer.pending?.payload;
+  /**
+   * Put the pending snapshot back onto the receiver's own WebSocket and keep the route. The receiver's ACK said it
+   * applied this snapshot, but a self-reported sequence is not proof — the bytes still go out, and a receiver that
+   * already has them drops the duplicate by sequence.
+   */
+  resend(plan, peer) {
+    const pending = peer.pending;
+    this.clearPending(peer);
+    if (!pending || peer.session.roomCode !== plan.room.code) return false;
+    // The signed frame is the resync: the same bytes the relay would have forwarded.
+    return sendRaw(peer.session.ws, pending.data);
+  }
+
+  /**
+   * Abandon the route and put the pending snapshot onto the receiver's WebSocket. `teardown` marks the frame
+   * `fallback`, which tells the client to close the channels it was listening on, and blocks the star for that
+   * receiver until it reports a fresh, unready pulse.
+   * @param {object} plan @param {object} peer @param {boolean} [teardown]
+   */
+  fallback(plan, peer, teardown = false) {
+    const pending = peer.pending;
     this.clearPending(peer);
     peer.ready = false;
     peer.leaseUntil = 0;
-    if (timeout) peer.blocked = true;
-    if (latest && peer.session.roomCode === plan.room.code) sendRaw(peer.session.ws, latest);
+    if (teardown) peer.blocked = true;
+    if (!pending || peer.session.roomCode !== plan.room.code) return;
+    sendRaw(peer.session.ws, teardown ? encode({ ...pending.frame, fallback: true }) : pending.payload);
   }
 
   rawFallback(room, sessions, plan) {
-    // A new raw snapshot has no peer sequence. Invalidate pending peer bytes before it can supersede them,
-    // including two snapshots produced in the same serverNow millisecond.
+    // A new snapshot arrives while some receivers still have one in flight: drop the plan so the lobby's own fanout
+    // serves everyone, then re-sync (which re-arms the route for the next snapshot).
     if (plan.peers.some((p) => p.pending)) {
       this.clear(room);
       this.sync(room, sessions);
     }
-    return false;
+    return null;
   }
 
-  /** True if this method delivered the broadcast; false leaves the original WS broadcast to the lobby. */
+  /**
+   * Try the peer route for one public snapshot. The relay gets the signed frame over its own WebSocket — it must
+   * forward these exact bytes, so this path deliberately bypasses the state-delta transport. Every other member
+   * stays in the lobby's fanout, which is the server's own reliable send.
+   * @param {object} room
+   * @param {import('./net.js').Session[]} sessions the room's connected members
+   * @param {string} payload the encoded stamped m.public
+   * @returns {Set<import('./net.js').Session> | null} the members this call took over (the lobby skips them);
+   *   null leaves the whole fanout to the lobby.
+   */
   broadcast(room, sessions, payload) {
     const plan = this.sync(room, sessions);
-    if (!plan) return false;
+    if (!plan) return null;
     const now = this.now();
     const relay = plan.peers[0];
     const receivers = relay.ready && relay.leaseUntil > now
@@ -180,24 +227,18 @@ export class PeerRelay {
     const frame = { ...unsigned, signature };
     const data = encode(frame);
     if (!sendRaw(relay.session.ws, data)) {
-      for (const p of plan.peers) this.fallback(plan, p);
-      return false;
+      // The relay's socket cannot carry it: the route serves nobody, so it is torn down and the lobby fans out.
+      this.clear(room);
+      return null;
     }
     plan.seq = seq;
-    for (const session of sessions) {
-      if (session === relay.session) continue;
-      const peer = plan.peers.find((p) => p.session === session);
-      if (receivers.includes(peer)) {
-        const oldestSeq = peer.pending?.oldestSeq ?? seq;
-        peer.pending = { seq, payload, frame, oldestSeq };
-        // Sending newer state cannot postpone the deadline; only an advancing ACK can do that.
-        if (!peer.timer) this.watch(plan, peer);
-      } else {
-        if (peer) this.clearPending(peer);
-        if (!peer || !sendRaw(session.ws, data)) sendRaw(session.ws, payload);
-      }
+    const handled = new Set([relay.session]);
+    for (const peer of receivers) {
+      handled.add(peer.session);
+      peer.pending = { seq, payload, frame, data, armedAck: peer.ack };
+      if (!peer.timer) this.watch(plan, peer);
     }
-    return true;
+    return handled;
   }
 
   clear(room) {
