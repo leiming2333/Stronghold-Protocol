@@ -2,7 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createPublicKey, verify } from 'node:crypto';
 import { Lobby, Room } from '../server/lobby.js';
-import { PeerRelay, parseIceServers, P2P_FRAME_BYTES } from '../server/peerRelay.js';
+import { PeerRelay, parseIceServers, p2pEnabledFromEnv, P2P_FRAME_BYTES } from '../server/peerRelay.js';
+import { negotiateStateDelta } from '../server/stateTransport.js';
+import { applyStatePatch, STATE_DELTA_VERSION } from '../shared/stateDelta.js';
 import { validateC2S } from '../shared/protocol.js';
 import { ERR } from '../shared/constants.js';
 
@@ -117,12 +119,12 @@ test('opt-in, opt-out, nonready members, unsupported clients, and solo games ret
   assert.equal(config.publicKey.d, undefined);
   assert.deepEqual(config.iceServers, []);
   ready(a); ready(b); clear();
-  const raw = lobby.broadcastRoom(room, { t: 'm.public', turn: 1 });
+  lobby.broadcastRoom(room, { t: 'm.public', turn: 1 });
   assert.equal(a.ws.frames[0].t, 'p2p.frame');
-  assert.equal(b.ws.frames.length, 0);
-  assert.equal(c.ws.frames[0].seq, a.ws.frames[0].seq, 'nonready capable member receives the same signed frame directly');
-  assert.equal(c.ws.frames[0].payload, raw);
-  assert.deepEqual(d.ws.frames[0], JSON.parse(raw));
+  assert.equal(b.ws.frames.length, 0, 'a ready receiver is served by the relay');
+  // c is capable but not ready yet, so the lobby's own send keeps it covered — the plain, authoritative frame.
+  assert.deepEqual(c.ws.frames.map(stateOnly), [{ t: 'm.public', turn: 1 }]);
+  assert.deepEqual(d.ws.frames.map(stateOnly), [{ t: 'm.public', turn: 1 }]);
   const oldEpoch = plan().epoch;
   enable(b, false);
   assert.notEqual(plan().epoch, oldEpoch);
@@ -169,7 +171,7 @@ test('protocol rejects injection, ambiguous signals, oversized SDP, and invalid 
   assert(validateC2S({ t: 'p2p.frame', epoch: 'epoch', seq: 1, payload: '{}' }), 'clients cannot inject server frames');
 });
 
-test('unacknowledged fanout resends latest state by the original deadline and blocks repeated ready pulses', async (t) => {
+test('an acknowledged snapshot still comes back on WebSocket by the original deadline', async (t) => {
   const { lobby, room, clients: [a, b], start, ready, plan, clear } = setup(t, 2, { ackMs: 70 });
   start();
   lobby.broadcastRoom(room, { t: 'm.public', turn: 1 });
@@ -178,23 +180,38 @@ test('unacknowledged fanout resends latest state by the original deadline and bl
   lobby.broadcastRoom(room, { t: 'm.public', turn: 2 });
   assert.equal(plan().peers[1].timer, timer, 'new frames cannot postpone an old unacknowledged delivery');
   assert.equal(b.ws.frames.length, 0);
+  ready(b, 2);
+  assert.equal(plan().peers[1].timer, timer, 'an acknowledgement cannot cancel it either');
   await pause(70);
+  // The bytes still go out: a receiver that already had them drops the copy by sequence.
   assert.equal(b.ws.frames.length, 1);
   assert.equal(b.ws.frames[0].t, 'p2p.frame');
-  assert.equal(b.ws.frames[0].fallback, true);
+  assert.equal(b.ws.frames[0].fallback, undefined, 'a confirmed route is not torn down');
   assert.equal(JSON.parse(b.ws.frames[0].payload).turn, 2);
   assert.equal(plan().peers[1].timer, null);
-  assert.equal(plan().peers[1].ready, false);
-  assert.equal(plan().peers[1].blocked, true);
-  ready(b, 2); clear();
+  assert.equal(plan().peers[1].ready, true, 'the route stays in service');
+  assert.equal(plan().peers[1].blocked, false);
+  clear();
   lobby.broadcastRoom(room, { t: 'm.public', turn: 3 });
-  assert.deepEqual(b.ws.frames.map(stateOnly), [{ t: 'm.public', turn: 3 }]);
-  ready(b, 2, false); ready(b, 2); clear();
-  lobby.broadcastRoom(room, { t: 'm.public', turn: 4 });
-  assert.equal(a.ws.frames[0].t, 'p2p.frame');
+  assert.equal(a.ws.frames.at(-1).t, 'p2p.frame');
+  assert.equal(b.ws.frames.length, 0, 'the receiver is still served over RTC');
+});
+
+test('a receiver that confirms a sequence it never applied still recovers the snapshot', async (t) => {
+  const { lobby, room, clients: [_a, b], start, ready, plan } = setup(t, 2, { ackMs: 60 });
+  start();
+  lobby.broadcastRoom(room, { t: 'm.public', turn: 1, gold: 7 });
+  // The receiver's pulse claims the newest sequence although the forwarded bytes never reached game state
+  // (the old client acknowledged frames it had merely received). The snapshot stays on the hook.
+  ready(b, 1);
+  assert.notEqual(plan().peers[1].timer, null, 'the watchdog is not cancelled by a self-reported sequence');
   assert.equal(b.ws.frames.length, 0);
-  ready(b, 3);
-  assert.equal(plan().peers[1].timer, null, 'a verified newest acknowledgement releases fallback resources');
+  await pause(80);
+  const frames = b.ws.frames.filter((f) => f.t === 'p2p.frame' || f.t === 'm.public');
+  assert.equal(frames.length, 1, 'the snapshot is re-delivered over the authenticated WebSocket');
+  const msg = frames[0].t === 'p2p.frame' ? JSON.parse(frames[0].payload) : frames[0];
+  assert.equal(msg.turn, 1);
+  assert.equal(msg.gold, 7, 'no state is lost behind a false acknowledgement');
 });
 
 test('fresh readiness needs a lease; signing/ack timers are absent for raw-only and oversized state', (t) => {
@@ -211,34 +228,36 @@ test('fresh readiness needs a lease; signing/ack timers are absent for raw-only 
   for (const p of plan().peers) assert.equal(p.timer, null);
 });
 
-test('steady delayed ACK progress stays healthy while stagnant ACK heartbeats still time out', (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const { lobby, room, clients: [a, b], start, ready, plan, advance } = setup(t, 2, { ackMs: 250 });
+test('steady delayed ACK progress keeps the route while stagnant ACK heartbeats still time out', async (t) => {
+  const { lobby, room, clients: [a, b], start, ready, plan, clear } = setup(t, 2, { ackMs: 100 });
   start();
   lobby.broadcastRoom(room, { t: 'm.public', turn: 1 });
-  for (let turn = 2; turn <= 12; turn++) {
-    t.mock.timers.tick(100); advance(100);
-    lobby.broadcastRoom(room, { t: 'm.public', turn });
-    const previousTimer = plan().peers[1].timer;
-    ready(a, turn - 1); ready(b, turn - 1);
-    assert.notEqual(plan().peers[1].timer, previousTimer, 'an advancing ACK refreshes the oldest in-flight deadline');
-    assert.equal(plan().peers[1].pending.seq, turn);
-    assert.equal(plan().peers[1].pending.oldestSeq, turn);
-    assert.equal(b.ws.frames.length, 0, 'receiver always lags the latest frame but keeps receiving through RTC');
-  }
-  const fixedDeadline = plan().peers[1].timer;
-  for (let turn = 13; turn <= 14; turn++) {
-    t.mock.timers.tick(100); advance(100);
-    lobby.broadcastRoom(room, { t: 'm.public', turn });
-    ready(a, turn - 1); ready(b, 11);
-    assert.equal(plan().peers[1].timer, fixedDeadline, 'unchanged ACK heartbeats and new state do not hide a blackholed relay');
-  }
-  t.mock.timers.tick(49);
-  assert.equal(b.ws.frames.length, 0);
-  t.mock.timers.tick(1);
+  const timer = plan().peers[1].timer;
+  await pause(40);
+  lobby.broadcastRoom(room, { t: 'm.public', turn: 2 });
+  assert.equal(plan().peers[1].timer, timer, 'new state cannot postpone the deadline');
+  // The receiver always lags the newest frame but keeps confirming: the watchdog re-sends and leaves the route up.
+  ready(a, 1); ready(b, 1);
+  await pause(80);
+  assert.equal(plan().peers[1].blocked, false, 'an advancing ACK is a healthy receiver, not a blackhole');
+  assert.equal(plan().peers[1].ready, true);
   assert.equal(b.ws.frames.length, 1);
-  assert.equal(b.ws.frames[0].fallback, true);
-  assert.equal(JSON.parse(b.ws.frames[0].payload).turn, 14, 'timeout still resends the latest available state');
+  assert.equal(b.ws.frames[0].fallback, undefined);
+  assert.equal(JSON.parse(b.ws.frames[0].payload).turn, 2, 'the latest snapshot is what comes back');
+  clear();
+  // Now its watermark stops moving while new state keeps coming: the route is torn down and the frame says so.
+  lobby.broadcastRoom(room, { t: 'm.public', turn: 3 });
+  const fixed = plan().peers[1].timer;
+  for (let turn = 4; turn <= 5; turn++) {
+    await pause(40);
+    lobby.broadcastRoom(room, { t: 'm.public', turn });
+    ready(a, turn - 1); ready(b, 1);  // the receiver's watermark never moves
+    assert.equal(plan().peers[1].timer, fixed, 'unchanged ACK heartbeats and new state do not hide a blackholed relay');
+  }
+  await pause(60);
+  assert.equal(b.ws.frames.length, 1);
+  assert.equal(b.ws.frames.at(-1).fallback, true, 'a stagnant watermark is treated as a blackholed route');
+  assert.equal(JSON.parse(b.ws.frames.at(-1).payload).turn, 5, 'timeout still resends the latest available state');
   assert.equal(plan().peers[1].blocked, true);
 });
 
@@ -271,15 +290,17 @@ test('public delivery stream orders raw, RTC, and direct snapshots across topolo
 });
 
 test('relay WS send failure immediately falls back for every receiver', (t) => {
-  const { lobby, room, clients: [a, b, c], start, plan } = setup(t);
+  const { lobby, room, clients: [a, b, c], start } = setup(t);
   start();
   a.ws.send = () => { throw new Error('socket failure'); };
   const payload = { t: 'm.public', turn: 1 };
   lobby.broadcastRoom(room, payload);
-  assert.deepEqual(b.ws.frames.map(stateOnly), [payload]);
-  assert.deepEqual(c.ws.frames.map(stateOnly), [payload]);
-  assert.equal(plan().seq, 0);
-  for (const peer of plan().peers) assert.equal(peer.timer, null);
+  // The relay's socket cannot carry the fanout, so the route is dropped (every member is told peer delivery is off)
+  // and the lobby sends its own copy to everyone.
+  assert.deepEqual(b.ws.frames.filter((f) => f.t === 'm.public').map(stateOnly), [payload]);
+  assert.deepEqual(c.ws.frames.filter((f) => f.t === 'm.public').map(stateOnly), [payload]);
+  assert.deepEqual(b.ws.frames.filter((f) => f.t === 'p2p.config'), [{ t: 'p2p.config', enabled: false }]);
+  assert.equal(lobby.peerRelay.rooms.size, 0);
 });
 
 test('raw fallback invalidates delayed peer bytes before a newer oversized snapshot', (t) => {
@@ -325,6 +346,77 @@ test('membership, replacement, match lifecycle, disconnect, and shutdown invalid
   lobby.shutdown();
   assert.equal(lobby.peerRelay.rooms.size, 0);
   assert(ending.peers.every((p) => p.timer === null));
+});
+
+test('peer delivery is off unless the operator enables SP_P2P', (t) => {
+  assert.equal(p2pEnabledFromEnv({}), false, 'no variable at all keeps the server fanout');
+  for (const value of ['', '0', 'off', 'false', 'no', '2']) assert.equal(p2pEnabledFromEnv({ SP_P2P: value }), false, value);
+  for (const value of ['1', 'true', 'TRUE', ' on ']) assert.equal(p2pEnabledFromEnv({ SP_P2P: value }), true, value);
+  const old = process.env.SP_P2P;
+  try {
+    delete process.env.SP_P2P;
+    const lobby = new Lobby({ registry: { byId: () => null }, getData: () => ({}), now: () => 1000 });
+    t.after(() => lobby.shutdown());
+    assert.equal(lobby.peerRelay.enabled, false, 'a plain start distributes public state from the server');
+    const room = new Room('ABCD', 'coop', 'NORMAL', 1000);
+    lobby.rooms.set(room.code, room);
+    const client = { playerId: 'p1', name: 'A', connected: true, roomCode: room.code, ws: socket() };
+    lobby.registry.byId = () => client;
+    room.seats[0] = lobby.humanSeat(0, client);
+    room.hostId = client.playerId;
+    assert.deepEqual(lobby.onMessage(client, { t: 'p2p.enable', enabled: true }), { ok: true });
+    assert.equal(lobby.peerRelay.capable(client), false, 'an opt-in cannot switch peer delivery on by itself');
+    assert.deepEqual(client.ws.frames.at(-1), { t: 'p2p.config', enabled: false }, 'the browser is told it is off');
+    const payload = { t: 'm.public', turn: 1 };
+    lobby.broadcastRoom(room, payload);
+    assert.deepEqual(client.ws.frames.filter((f) => f.t === 'm.public').map(stateOnly), [payload]);
+    assert.equal(lobby.peerRelay.rooms.size, 0, 'no room plan exists while the switch is off');
+  } finally {
+    if (old === undefined) delete process.env.SP_P2P;
+    else process.env.SP_P2P = old;
+  }
+});
+
+test('peer delivery coexists with the negotiated state-delta transport', async (t) => {
+  const { lobby, room, clients: [a, b], start, plan, clear } = setup(t, 2, { ackMs: 60 });
+  // A client that named the version in its hello gets its public view as m.state frames (shared/stateDelta.js).
+  negotiateStateDelta(a.ws, STATE_DELTA_VERSION);
+  negotiateStateDelta(b.ws, STATE_DELTA_VERSION);
+  // Nobody has opted in yet, so the lobby's own fanout runs: a full frame first, then a patch.
+  const first = lobby.broadcastRoom(room, { t: 'm.public', serverNow: 1000, turn: 1 });
+  const full = a.ws.frames.at(-1);
+  assert.equal(full.t, 'm.state');
+  assert.deepEqual(full.full, JSON.parse(first));
+  clear();
+  const second = lobby.broadcastRoom(room, { t: 'm.public', serverNow: 1001, turn: 2 });
+  const patch = a.ws.frames.at(-1);
+  assert.equal(patch.t, 'm.state');
+  assert.equal(patch.base, full.seq, 'each connection keeps its own baseline');
+  assert.ok(patch.patch);
+  const baseline = applyStatePatch(full.full, patch.patch);
+  assert.deepEqual(baseline, JSON.parse(second));
+  // Now both opt in. The relay receives the signed frame over its own WebSocket — never as a delta, because it
+  // must forward these exact bytes — and the ready receiver is left to the peer channel.
+  start(); clear();
+  lobby.broadcastRoom(room, { t: 'm.public', serverNow: 1002, turn: 3 });
+  assert.equal(a.ws.frames.at(-1).t, 'p2p.frame');
+  const third = a.ws.frames.at(-1).payload;
+  assert.equal(b.ws.frames.length, 0, 'the receiver is served over RTC');
+  // Its watchdog puts that snapshot (the LATEST one) back on its own WebSocket, marked `fallback`, and abandons the route.
+  await pause(120);
+  const fallback = b.ws.frames.at(-1);
+  assert.equal(fallback.t, 'p2p.frame');
+  assert.equal(fallback.fallback, true);
+  assert.equal(fallback.payload, third, 'the receiver gets the very snapshot it missed');
+  assert.equal(plan().peers[1].blocked, true);
+  // Peer traffic never moved the delta baseline, so the ordinary WebSocket stream resumes with a patch against
+  // the baseline that socket already had: one delivery order, never two.
+  clear();
+  const fourth = lobby.broadcastRoom(room, { t: 'm.public', serverNow: 1003, turn: 6 });
+  const resumed = b.ws.frames.at(-1);
+  assert.equal(resumed.t, 'm.state');
+  assert.equal(resumed.base, patch.seq, 'the WebSocket stream resumes from the baseline peer traffic never touched');
+  assert.deepEqual(applyStatePatch(baseline, resumed.patch), JSON.parse(fourth));
 });
 
 test('ICE configuration accepts STUN/TURN and rejects malformed configuration without exposing secrets', () => {

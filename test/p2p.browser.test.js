@@ -38,7 +38,23 @@ test('three real RTC clients receive signed public state with one WS copy and re
   await page.setContent('<!doctype html><title>P2P transport integration</title>');
   await page.evaluate(async () => {
     const { Net } = await import('/js/net.js');
-    globalThis.p2pTest = { clients: [], ws: [[], [], []], snapshots: [[], [], []], peerFrames: [[], [], []] };
+    const publicOf = (msg) => {
+      if (msg?.t === 'm.public') return msg;
+      if (msg?.t === 'p2p.frame' && typeof msg.payload === 'string') {
+        try { return JSON.parse(msg.payload); } catch { return null; }
+      }
+      // The merged state-delta transport wraps the same view: a full frame carries it, a delta carries only patches.
+      if (msg?.t === 'm.state' && msg.kind === 'm.public') return msg.full ?? null;
+      return null;
+    };
+    globalThis.p2pTest = {
+      clients: [], ws: [[], [], []], snapshots: [[], [], []], peerFrames: [[], [], []],
+      // "Did this snapshot reach me over MY OWN authenticated WebSocket?" — whatever wrapper the lobby used.
+      wsCarries(i, probe) {
+        return this.ws[i].some((msg) => publicOf(msg)?.probe === probe
+          || (msg?.t === 'm.state' && msg.kind === 'm.public' && JSON.stringify(msg).includes(`"${probe}"`)));
+      },
+    };
     for (let i = 0; i < 3; i++) {
       const net = new Net();
       p2pTest.clients.push(net);
@@ -124,9 +140,47 @@ test('three real RTC clients receive signed public state with one WS copy and re
   }, 'closed data channel reports unready');
   srv.lobby.broadcastRoom(room, { t: 'm.public', serverNow: Date.now(), probe: 'fallback' });
   await page.waitForFunction(() => p2pTest.snapshots.every((messages) => messages.some((msg) => msg.probe === 'fallback')));
-  const fallbackWs = await page.evaluate((i) => p2pTest.ws[i].some((msg) => msg.t === 'm.public' && msg.probe === 'fallback'
-    || msg.t === 'p2p.frame' && msg.payload.includes('fallback')), receiverIndex);
+  const fallbackWs = await page.evaluate((i) => p2pTest.wsCarries(i, 'fallback'), receiverIndex);
   assert.equal(fallbackWs, true, 'the receiver keeps receiving state over its authenticated WebSocket');
+  const fallbackPeer = await page.evaluate((i) => p2pTest.peerFrames[i].some((frame) => frame.payload.includes('fallback')), receiverIndex);
+  assert.equal(fallbackPeer, false, 'and not over the channel that just closed');
+  // The dangerous case: a relay whose data channel stays OPEN but stops forwarding. Receivers must not be
+  // blackholed — and a receiver that still acknowledges a sequence it never received must not be believed —
+  // so the lobby's watchdog re-sends the newest snapshot over each receiver's own WebSocket after ackMs (2.5 s).
+  // The other receiver still holds a live channel, so it is the one we blackhole here. Let its acknowledgement
+  // watermark catch up first: the watchdog arms against the watermark it sees at that moment, and a stale
+  // "still moving" reading would let a silent relay look alive.
+  const silentIndex = receivers[1];
+  const silentId = identities[silentIndex].id;
+  const silentPeer = () => srv.lobby.peerRelay.rooms.get(room)?.peers.find((p) => p.session.playerId === silentId);
+  await page.waitForFunction(({ relayIndex, silentIndex }) => {
+    const link = p2pTest.clients[relayIndex].peers.links.get(p2pTest.clients[silentIndex].playerId);
+    return !!link?.channel && link.channel.readyState === 'open';
+  }, { polling: 100 }, { relayIndex, silentIndex });
+  await eventually(() => {
+    const plan = srv.lobby.peerRelay.rooms.get(room);
+    const peer = silentPeer();
+    return !!plan && !!peer && peer.ack === plan.seq && peer.pending === null && !peer.timer;
+  }, 'the receiver acknowledges the newest snapshot it holds and its previous watchdog has settled');
+  const silentAt = Date.now();
+  await page.evaluate(({ relayIndex, silentIndex }) => {
+    const relay = p2pTest.clients[relayIndex];
+    relay.peers.links.get(p2pTest.clients[silentIndex].playerId).channel.send = () => {};   // open, but silent
+  }, { relayIndex, silentIndex });
+  srv.lobby.broadcastRoom(room, { t: 'm.public', serverNow: Date.now(), probe: 'blackhole' });
+  // The newest snapshot comes back over the receiver's own WebSocket even though its watermark kept moving, and the
+  // frame is marked `fallback` so the client abandons the channel that stopped carrying data.
+  await page.waitForFunction((i) => p2pTest.ws[i].some((msg) => msg.t === 'p2p.frame'
+    && msg.fallback === true && msg.payload.includes('blackhole')), { timeout: 12000, polling: 100 }, silentIndex);
+  const gap = Date.now() - silentAt;
+  assert.ok(gap >= 2000 && gap < 6000, `the fallback landed inside the watchdog window (${gap} ms)`);
+  const applied = await page.evaluate((i) => p2pTest.snapshots[i].some((msg) => msg.probe === 'blackhole'), silentIndex);
+  assert.equal(applied, true, 'the receiver recovers sync from the authoritative WebSocket copy');
+  const route = await page.evaluate((i) => ({
+    links: p2pTest.clients[i].peers.links.size,
+  }), silentIndex);
+  assert.equal(route.links, 0, 'and abandons the silent route');
+
   assert.deepEqual(problems, []);
   await page.evaluate(() => p2pTest.clients.forEach((net) => net.close()));
 });

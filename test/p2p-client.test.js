@@ -149,6 +149,25 @@ test('replays, old epochs and out-of-order snapshots never roll state back', asy
   peer.reset();
 });
 
+test('the acknowledgement reports applied state, not merely received bytes', async () => {
+  const { net, peer } = fixture();
+  peer.receive(await signed(1, { t: 'm.public', serverNow: 200 }), false);
+  await peer.incoming;
+  assert.equal(peer.seq, 1, 'a snapshot that reached game state may be acknowledged');
+  // A frame the state already supersedes is not applied, but the ACK still covers it: the state we hold is newer,
+  // so "I am past this frame" is true — and the server does not treat it as proof either (it always re-sends).
+  peer.receive(await signed(2, { t: 'm.public', serverNow: 100 }), false);
+  await peer.incoming;
+  assert.equal(net.snapshots.length, 1, 'the older snapshot is never applied');
+  assert.equal(peer.seq, 2);
+  // A payload that cannot be applied is not acknowledged at all: the lobby keeps it pending.
+  peer.receive(await signed(3, { t: 'm.public' }), false);
+  await peer.incoming;
+  assert.equal(net.snapshots.length, 1);
+  assert.equal(peer.seq, 2, 'no acknowledgement without an applied snapshot');
+  peer.reset();
+});
+
 test('a newer direct WebSocket resync supersedes a peer frame still being verified', async () => {
   let release;
   let started;
